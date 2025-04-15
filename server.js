@@ -5,6 +5,8 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const dotenv = require('dotenv');
 
+
+
 // Load environment variables
 dotenv.config();
 
@@ -14,11 +16,12 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_key_12345_secure_r
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/sol_basket';
 
 // Middleware
+// Middleware
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:3001',
+  origin: ['https://sol-client.vercel.app', process.env.CLIENT_URL || 'http://localhost:3001'],
   credentials: true,
 }));
-app.use(express.json());
+
 
 // MongoDB connection
 mongoose.connect(MONGODB_URI, {
