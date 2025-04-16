@@ -15,12 +15,27 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_key_12345_secure_r
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/sol_basket';
 const DB_FILE = process.env.DB_FILE || 'votes.json';
 
+// Visit Counter
+let visitCount = 0;
+
 // Middleware
 app.use(express.json());
 app.use(cors({
-  origin: ['https://sol-client.vercel.app', process.env.CLIENT_URL || 'http://localhost:3001'],
+  origin: [
+    'https://sol-client.vercel.app',
+    'http://localhost:3000',
+    'http://localhost:3001',
+    process.env.CLIENT_URL,
+  ],
   credentials: true,
 }));
+
+// Visit Counter Middleware
+app.use((req, res, next) => {
+  visitCount++;
+  console.log(`Посещений: ${visitCount}`);
+  next();
+});
 
 // MongoDB connection
 mongoose.connect(MONGODB_URI, {
@@ -49,72 +64,91 @@ const visitorSchema = new mongoose.Schema({
 
 const Visitor = mongoose.model('Visitor', visitorSchema);
 
-// Kalıcı veriyi oku (Read persistent data)
+// Read persistent data
 const readVotes = () => {
   try {
-    const data = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
+    const data = JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
     return {
       support: data.support || 0,
       oppose: data.oppose || 0,
       voters: new Set(data.voters || []),
-      visitors: new Set(data.visitors || []),
+      visitors: data.visitors || [],
     };
   } catch {
     return {
       support: 0,
       oppose: 0,
       voters: new Set(),
-      visitors: new Set(),
+      visitors: [],
     };
   }
 };
 
-// Kalıcı veriyi kaydet (Save persistent data)
+// Save persistent data
 const saveVotes = (votes, voters, visitors) => {
   const data = {
     support: votes.support,
     oppose: votes.oppose,
     voters: Array.from(voters),
-    visitors: Array.from(visitors),
+    visitors,
   };
-  fs.writeFileSync(DB_FILE, JSON.stringify(data), "utf-8");
+  fs.writeFileSync(DB_FILE, JSON.stringify(data), 'utf-8');
 };
 
+// Initialize data
 const stored = readVotes();
 let votes = { support: stored.support, oppose: stored.oppose };
 let allVoters = stored.voters;
-let all_visitors = stored.visitors;
+let allVisitors = stored.visitors;
+
+// Clean expired visitors
+const cleanVisitors = () => {
+  const now = Date.now();
+  const expiry = 5 * 60 * 1000; // 5 minutes
+  allVisitors = allVisitors.filter(v => now - v.timestamp < expiry);
+  saveVotes(votes, allVoters, allVisitors);
+};
+
+// Clean every minute
+setInterval(cleanVisitors, 60 * 1000);
+
+// Root Endpoint for Visit Count
+app.get('/', (req, res) => {
+  res.send(`Количество посещений: ${visitCount}`);
+});
 
 // Vote endpoints
-app.post("/vote", (req, res) => {
+app.post('/vote', (req, res) => {
   const { vote } = req.body;
-  const ip = req.ip;
+  const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
 
   if (allVoters.has(ip)) {
-    return res.status(403).json({ message: "You already voted." });
+    return res.status(403).json({ message: 'You already voted.' });
   }
 
-  if (vote === "support" || vote === "oppose") {
+  if (vote === 'support' || vote === 'oppose') {
     votes[vote]++;
     allVoters.add(ip);
-    saveVotes(votes, allVoters, all_visitors);
+    saveVotes(votes, allVoters, allVisitors);
     return res.json({ success: true });
   }
 
-  return res.status(400).json({ message: "Invalid vote." });
+  return res.status(400).json({ message: 'Invalid vote.' });
 });
 
-app.get("/results", (req, res) => {
-  const ip = req.ip;
-  if (!all_visitors.has(ip)) {
-    all_visitors.add(ip);
-    saveVotes(votes, allVoters, all_visitors);
+app.get('/results', (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+  const now = Date.now();
+  if (!allVisitors.find(v => v.ip === ip)) {
+    allVisitors.push({ ip, timestamp: now });
+    saveVotes(votes, allVoters, allVisitors);
   }
 
+  cleanVisitors();
   res.json({
-    votes: votes,
-    visitors: all_visitors.size,
-    message: "Thank you for your visit!",
+    votes,
+    visitors: allVisitors.length,
+    message: 'Thank you for your visit!',
   });
 });
 
@@ -191,13 +225,14 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// Track Visitor Route (updated with both MongoDB and file-based tracking)
+// Track Visitor Route
 app.post('/api/visitors/track', async (req, res) => {
   try {
     const { userAgent } = req.body;
     const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    const now = Date.now();
 
-    // MongoDB tracking (for long-term analytics)
+    // MongoDB tracking
     const oneDayAgo = new Date();
     oneDayAgo.setDate(oneDayAgo.getDate() - 1);
 
@@ -214,19 +249,20 @@ app.post('/api/visitors/track', async (req, res) => {
       await visitor.save();
     }
 
-    // File-based tracking (for real-time counts)
-    if (!all_visitors.has(ip)) {
-      all_visitors.add(ip);
-      saveVotes(votes, allVoters, all_visitors);
+    // File-based tracking
+    if (!allVisitors.find(v => v.ip === ip)) {
+      allVisitors.push({ ip, timestamp: now });
+      saveVotes(votes, allVoters, allVisitors);
     }
 
+    cleanVisitors();
     const visitorCount = await Visitor.countDocuments();
     const userCount = await User.countDocuments();
 
     res.json({
       users: userCount,
       visitors: visitorCount,
-      realtimeVisitors: all_visitors.size, // Добавлено: текущее количество посетителей из файла
+      realtimeVisitors: allVisitors.length,
     });
   } catch (err) {
     console.error('Error tracking visitor:', err);
@@ -234,15 +270,17 @@ app.post('/api/visitors/track', async (req, res) => {
   }
 });
 
-// Get User and Visitor Counts Route (updated)
+// Get User and Visitor Counts Route
 app.get('/api/users/count', async (req, res) => {
   try {
     const userCount = await User.countDocuments();
     const visitorCount = await Visitor.countDocuments();
+    cleanVisitors();
     res.json({
       users: userCount,
       visitors: visitorCount,
-      realtimeVisitors: all_visitors.size, // Добавлено: текущее количество посетителей из файла
+      realtimeVisitors: allVisitors.length,
+      totalVisits: visitCount, // Include total visits in response
     });
   } catch (err) {
     console.error('Error fetching counts:', err);
