@@ -4,7 +4,6 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const fs = require('fs');
 
 // Load environment variables
 dotenv.config();
@@ -13,7 +12,6 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_key_12345_secure_random_string';
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/sol_basket';
-const DB_FILE = process.env.DB_FILE || 'votes.json';
 
 // Visit Counter
 let visitCount = 0;
@@ -21,21 +19,9 @@ let visitCount = 0;
 // Middleware
 app.use(express.json());
 app.use(cors({
-  origin: [
-    'https://sol-client.vercel.app',
-    'http://localhost:3000',
-    'http://localhost:3001',
-    process.env.CLIENT_URL,
-  ],
+  origin: ['https://sol-client.vercel.app', 'http://localhost:3000', 'http://localhost:3001', process.env.CLIENT_URL],
   credentials: true,
 }));
-
-// Visit Counter Middleware
-app.use((req, res, next) => {
-  visitCount++;
-  console.log(`Посещений: ${visitCount}`);
-  next();
-});
 
 // MongoDB connection
 mongoose.connect(MONGODB_URI, {
@@ -64,49 +50,91 @@ const visitorSchema = new mongoose.Schema({
 
 const Visitor = mongoose.model('Visitor', visitorSchema);
 
+// Vote Schema
+const voteSchema = new mongoose.Schema({
+  support: { type: Number, default: 0 },
+  oppose: { type: Number, default: 0 },
+  voters: [{ type: String }],
+  visitors: [{ ip: String, timestamp: Number }],
+  visitCount: { type: Number, default: 0 },
+});
+
+const Vote = mongoose.model('Vote', voteSchema);
+
 // Read persistent data
-const readVotes = () => {
+const readVotes = async () => {
   try {
-    const data = JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
+    let voteDoc = await Vote.findOne();
+    if (!voteDoc) {
+      voteDoc = new Vote();
+      await voteDoc.save();
+    }
     return {
-      support: data.support || 0,
-      oppose: data.oppose || 0,
-      voters: new Set(data.voters || []),
-      visitors: data.visitors || [],
+      support: voteDoc.support,
+      oppose: voteDoc.oppose,
+      voters: new Set(voteDoc.voters),
+      visitors: voteDoc.visitors,
+      visitCount: voteDoc.visitCount,
     };
-  } catch {
+  } catch (err) {
+    console.error('Error reading votes:', err);
     return {
       support: 0,
       oppose: 0,
       voters: new Set(),
       visitors: [],
+      visitCount: 0,
     };
   }
 };
 
 // Save persistent data
-const saveVotes = (votes, voters, visitors) => {
-  const data = {
-    support: votes.support,
-    oppose: votes.oppose,
-    voters: Array.from(voters),
-    visitors,
-  };
-  fs.writeFileSync(DB_FILE, JSON.stringify(data), 'utf-8');
+const saveVotes = async (votes, voters, visitors, visitCount) => {
+  try {
+    await Vote.updateOne(
+      {},
+      {
+        support: votes.support,
+        oppose: votes.oppose,
+        voters: Array.from(voters),
+        visitors,
+        visitCount,
+      },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.error('Error saving votes:', err);
+  }
 };
 
 // Initialize data
-const stored = readVotes();
-let votes = { support: stored.support, oppose: stored.oppose };
-let allVoters = stored.voters;
-let allVisitors = stored.visitors;
+let votes, allVoters, allVisitors;
+readVotes().then(data => {
+  votes = { support: data.support, oppose: data.oppose };
+  allVoters = data.voters;
+  allVisitors = data.visitors;
+  visitCount = data.visitCount;
+});
+
+// Visit Counter Middleware
+app.use(async (req, res, next) => {
+  try {
+    visitCount++;
+    await Vote.updateOne({}, { visitCount }, { upsert: true });
+    console.log(`Посещений: ${visitCount}`);
+    next();
+  } catch (err) {
+    console.error('Error updating visit count:', err);
+    next();
+  }
+});
 
 // Clean expired visitors
 const cleanVisitors = () => {
   const now = Date.now();
   const expiry = 5 * 60 * 1000; // 5 minutes
   allVisitors = allVisitors.filter(v => now - v.timestamp < expiry);
-  saveVotes(votes, allVoters, allVisitors);
+  saveVotes(votes, allVoters, allVisitors, visitCount);
 };
 
 // Clean every minute
@@ -118,7 +146,7 @@ app.get('/', (req, res) => {
 });
 
 // Vote endpoints
-app.post('/vote', (req, res) => {
+app.post('/vote', async (req, res) => {
   const { vote } = req.body;
   const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
 
@@ -129,19 +157,19 @@ app.post('/vote', (req, res) => {
   if (vote === 'support' || vote === 'oppose') {
     votes[vote]++;
     allVoters.add(ip);
-    saveVotes(votes, allVoters, allVisitors);
+    await saveVotes(votes, allVoters, allVisitors, visitCount);
     return res.json({ success: true });
   }
 
   return res.status(400).json({ message: 'Invalid vote.' });
 });
 
-app.get('/results', (req, res) => {
+app.get('/results', async (req, res) => {
   const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
   const now = Date.now();
   if (!allVisitors.find(v => v.ip === ip)) {
     allVisitors.push({ ip, timestamp: now });
-    saveVotes(votes, allVoters, allVisitors);
+    await saveVotes(votes, allVoters, allVisitors, visitCount);
   }
 
   cleanVisitors();
@@ -249,10 +277,10 @@ app.post('/api/visitors/track', async (req, res) => {
       await visitor.save();
     }
 
-    // File-based tracking
+    // File-based tracking (now in MongoDB)
     if (!allVisitors.find(v => v.ip === ip)) {
       allVisitors.push({ ip, timestamp: now });
-      saveVotes(votes, allVoters, allVisitors);
+      await saveVotes(votes, allVoters, allVisitors, visitCount);
     }
 
     cleanVisitors();
@@ -280,7 +308,7 @@ app.get('/api/users/count', async (req, res) => {
       users: userCount,
       visitors: visitorCount,
       realtimeVisitors: allVisitors.length,
-      totalVisits: visitCount, // Include total visits in response
+      totalVisits: visitCount,
     });
   } catch (err) {
     console.error('Error fetching counts:', err);
